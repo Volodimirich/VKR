@@ -1,0 +1,9 @@
+Csma daterate - 100Mbps
+Csma delay - 2
+Time between sending packets - 1
+Reconfiguration time - 5
+Sending time - <27236> Current time - <87158>
+Sending time - <27611> Current time - <87379>
+Sending time - <27699> Current time - <87469>
+Sending time - <27788> Current time - <87556>
+Sending time - <27874> Current time - <87641>
