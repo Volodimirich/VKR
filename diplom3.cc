@@ -48,34 +48,41 @@
 
 using namespace ns3;
 CsmaHelper csmaHelper;
-int start = clock();
+clock_t start = clock();
 std::ofstream out;
+int counter = 0;
 
 
-int get_packet_time(Packet pack) {
-    size_t size = 4;
+std::pair<int, int> get_packet_time(Packet pack) {
+    size_t size = 8;
     float time;
+    float packet_name;
     uint8_t *out_data =  static_cast<uint8_t *>(malloc(size));
     pack.CopyData(out_data, size);
     time = ((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]);
-//    time = (float)((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]) / CLOCKS_PER_SEC;
+    packet_name = ((out_data[7] << 24) | (out_data[6] << 16) | (out_data[5] << 8) | out_data[4]);
+//    time = ((float)((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]) )/ CLOCKS_PER_SEC;
     free(out_data);
-    return time;
+    return std::make_pair(time, packet_name);
 }
 
 Ptr<Packet> create_packet() {
-    size_t size = 4;
+    size_t size = 8;
     uint8_t *data = static_cast<uint8_t *>(malloc(size));
     int *data_int = (int *)data;
     data_int[0] = clock() - start;
+    data_int[1] = counter;
+    counter++;
+
     return Create<Packet> (data, size);
 }
 
 void dstSocketRecv (Ptr<Socket> socket) {
     Address from;
     Ptr<Packet> packet = socket->RecvFrom (from);
-    float time = get_packet_time(*packet);
-    out << "Sending time - <" <<  time << "> Current time - <" << clock() << ">" << std::endl;
+    std::pair<int, int> packet_info = get_packet_time(*packet);
+//    out << "Sending time - <" <<  time << "> Current time - <" << clock() << ">" << std::endl;
+    std::cout << "Sending time - <" <<  (packet_info.first/(double) CLOCKS_PER_SEC) << "> Current time - <" << (clock()/(double) CLOCKS_PER_SEC) << "> Packet name - <"  << packet_info.second << ">" << std::endl;
     packet->RemoveAllPacketTags ();
     packet->RemoveAllByteTags ();
     InetSocketAddress address = InetSocketAddress::ConvertFrom (from);
@@ -87,6 +94,7 @@ void dstSocketRecv (Ptr<Socket> socket) {
 void SendStuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port) {
     Ptr <Packet> p = create_packet();
     p->AddPaddingAtEnd(100);
+    std::cout << "Send to " << dstaddr << std::endl;
     sock->SendTo(p, 0, InetSocketAddress(dstaddr, port));
     return;
 }
@@ -108,7 +116,7 @@ void SwitchInstall(std::pair<size_t, size_t> indexes, NetDeviceContainer* switch
 class Controller : public OFSwitch13Controller
 {
 public:
-    void FuckingSlave (uint64_t swtch);
+    void BadReconf (uint64_t swtch);
 
 protected:
     void HandshakeSuccessful (Ptr<const RemoteSwitch> swtch);
@@ -123,16 +131,15 @@ Controller::HandshakeSuccessful (Ptr<const RemoteSwitch> swtch)
 }
 
 
-
 void
-Controller::FuckingSlave (uint64_t swtch)
+Controller::BadReconf (uint64_t swtch)
 {
     DpctlExecute (swtch, "flow-mod cmd=del,table=0,prio=1 in_port=2 write:output=1");
 }
 
 
 void OpenFlowCommandRule(uint64_t dpid,  Ptr<Controller> ctrl ) {
-    ctrl->FuckingSlave(dpid);
+    ctrl->BadReconf(dpid);
 //    DpctlExecute (dpid, "flow-mod cmd=add,table=0,prio=700 "
 //                        "in_port=4,eth_type=0x0800,ip_proto=6 apply:group=3");
 }
@@ -144,7 +151,7 @@ void OpenFlowCommandRule(uint64_t dpid,  Ptr<Controller> ctrl ) {
 int main (int argc, char *argv[])
 {
     float interval = 0.1;
-    float time = 0.1;
+    float time = 0;
     float rec_time = 10;
     int delay = 2;
     std::string daterate = "100Mbps";
@@ -159,7 +166,7 @@ int main (int argc, char *argv[])
     cmd.AddValue ("time_between_packages", "Time between sending packets", interval);
     cmd.AddValue ("reconfiguration", "Reconfiguration time", rec_time);
     cmd.Parse (argc, argv);
-    
+
     out << "Csma daterate - " <<  daterate << std::endl;
     out << "Csma delay - " <<  delay << std::endl;
     out << "Time between sending packets - " <<  interval << std::endl;
@@ -168,10 +175,12 @@ int main (int argc, char *argv[])
     // Enable checksum computations (required by OFSwitch13 module)
     GlobalValue::Bind ("ChecksumEnabled", BooleanValue (true));
 
-    // Create two host nodes
+    // Create two host nodesu
     Ptr<Node> PCLeft1 = CreateObject<Node> ();
+    Ptr<Node> PCMid1 = CreateObject<Node> ();
     Ptr<Node> PCRight1 = CreateObject<Node> ();
-    NodeContainer hosts = NodeContainer(PCLeft1, PCRight1);
+    NodeContainer hosts = NodeContainer(PCLeft1, PCMid1, PCRight1);
+//    NodeContainer hosts = NodeContainer(PCLeft1,  PCRight1);
 
     // Create two switch nodes
     NodeContainer switches;
@@ -198,7 +207,8 @@ int main (int argc, char *argv[])
     hostDevices.Add(pairDevs.Get(0));
     switchPorts[0].Add(pairDevs.Get(1));
 
-    pair = NodeContainer(hosts.Get(1), switches.Get(3));
+
+    pair = NodeContainer(hosts.Get(2), switches.Get(3));
     pairDevs = csmaHelper.Install(pair);
     hostDevices.Add(pairDevs.Get(0));
     switchPorts[3].Add(pairDevs.Get(1));
@@ -207,6 +217,11 @@ int main (int argc, char *argv[])
     SwitchInstall(std::make_pair(0, 1), switchPorts, switches);
     SwitchInstall(std::make_pair(1, 2), switchPorts, switches);
     SwitchInstall(std::make_pair(2, 3), switchPorts, switches);
+
+    pair = NodeContainer(hosts.Get(1), switches.Get(1));
+    pairDevs = csmaHelper.Install(pair);
+    hostDevices.Add(pairDevs.Get(0));
+    switchPorts[1].Add(pairDevs.Get(1));
 
 
     Ptr<Node> controllerNode = CreateObject<Node> ();
@@ -236,8 +251,11 @@ int main (int argc, char *argv[])
 
 
 
-    Ptr<Socket> srcSocket = Socket::CreateSocket (PCLeft1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
-    srcSocket->Bind ();
+//    Ptr<Socket> srcSocket = Socket::CreateSocket (PCMid1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    Ptr<Socket> srcSocketM = Socket::CreateSocket (PCMid1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    srcSocketM->Bind ();
+    Ptr<Socket> srcSocketL = Socket::CreateSocket (PCLeft1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    srcSocketL->Bind ();
 //
     Ptr<Socket> dstSocket = Socket::CreateSocket (PCRight1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     uint16_t dstport = 12345;
@@ -247,7 +265,8 @@ int main (int argc, char *argv[])
     dstSocket->SetRecvCallback (MakeCallback (&dstSocketRecv));
 
     while (time < rec_time*1.5) {
-        Simulator::Schedule (Seconds (time),&SendStuff, srcSocket, dstaddr, dstport);
+        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketL, dstaddr, dstport);
+//        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketM, dstaddr, dstport);
         time += interval;
     }
 
