@@ -50,29 +50,40 @@ using namespace ns3;
 CsmaHelper csmaHelper;
 clock_t start = clock();
 std::ofstream out;
-int counter = 0;
+int counter1 = 0;
+int counter2 = 0;
 
 
-std::pair<int, int> get_packet_time(Packet pack) {
-    size_t size = 8;
-    float time;
-    float packet_name;
+std::tuple<int, int, int> get_packet_time(Packet pack) {
+    size_t size = 12;
+    int time;
+    int packet_name;
+    int from;
     uint8_t *out_data =  static_cast<uint8_t *>(malloc(size));
     pack.CopyData(out_data, size);
     time = ((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]);
     packet_name = ((out_data[7] << 24) | (out_data[6] << 16) | (out_data[5] << 8) | out_data[4]);
+    from = ((out_data[11] << 24) | (out_data[10] << 16) | (out_data[9] << 8) | out_data[8]);
 //    time = ((float)((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]) )/ CLOCKS_PER_SEC;
     free(out_data);
-    return std::make_pair(time, packet_name);
+    return std::make_tuple(time, packet_name, from);
 }
 
-Ptr<Packet> create_packet() {
-    size_t size = 8;
+Ptr<Packet> create_packet(int from) {
+    size_t size = 12;
+    int ct;
+    if (from == 0) {
+        ct = counter1;
+        counter1++;
+    }  else {
+        ct = counter2;
+        counter2++;
+    }
     uint8_t *data = static_cast<uint8_t *>(malloc(size));
     int *data_int = (int *)data;
     data_int[0] = clock() - start;
-    data_int[1] = counter;
-    counter++;
+    data_int[1] = ct;
+    data_int[2] = from;
 
     return Create<Packet> (data, size);
 }
@@ -80,9 +91,11 @@ Ptr<Packet> create_packet() {
 void dstSocketRecv (Ptr<Socket> socket) {
     Address from;
     Ptr<Packet> packet = socket->RecvFrom (from);
-    std::pair<int, int> packet_info = get_packet_time(*packet);
+    int time, counter, send_from;
+    std::tie(time, counter, send_from) = get_packet_time(*packet);
 //    out << "Sending time - <" <<  time << "> Current time - <" << clock() << ">" << std::endl;
-    std::cout << "Sending time - <" <<  (packet_info.first/(double) CLOCKS_PER_SEC) << "> Current time - <" << (clock()/(double) CLOCKS_PER_SEC) << "> Packet name - <"  << packet_info.second << ">" << std::endl;
+    std::cout << "Sending time - <" <<  (time/(double) CLOCKS_PER_SEC) << "> Current time - <" << (clock()/(double) CLOCKS_PER_SEC) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
+    out << "Sending time - <" <<  (time/(double) CLOCKS_PER_SEC) << "> Current time - <" << (clock()/(double) CLOCKS_PER_SEC) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
     packet->RemoveAllPacketTags ();
     packet->RemoveAllByteTags ();
     InetSocketAddress address = InetSocketAddress::ConvertFrom (from);
@@ -91,8 +104,8 @@ void dstSocketRecv (Ptr<Socket> socket) {
 }
 
 
-void SendStuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port) {
-    Ptr <Packet> p = create_packet();
+void SendStuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port, int from) {
+    Ptr <Packet> p = create_packet(from);
     p->AddPaddingAtEnd(100);
     std::cout << "Send to " << dstaddr << std::endl;
     sock->SendTo(p, 0, InetSocketAddress(dstaddr, port));
@@ -154,6 +167,7 @@ int main (int argc, char *argv[])
     float time = 0;
     float rec_time = 10;
     int delay = 2;
+    int bad_rec;
     std::string daterate = "100Mbps";
 
 
@@ -165,6 +179,7 @@ int main (int argc, char *argv[])
     cmd.AddValue ("delay", "Csma delay(MilliSeconds)", delay);
     cmd.AddValue ("time_between_packages", "Time between sending packets", interval);
     cmd.AddValue ("reconfiguration", "Reconfiguration time", rec_time);
+    cmd.AddValue ("bad_reconf_on", "Where in bad reconfiguration? 3-everythere, 2-Upper, 1-Lower, 0-Nowhere", bad_rec);
     cmd.Parse (argc, argv);
 
     out << "Csma daterate - " <<  daterate << std::endl;
@@ -177,15 +192,22 @@ int main (int argc, char *argv[])
 
     // Create two host nodesu
     Ptr<Node> PCLeft1 = CreateObject<Node> ();
+    Ptr<Node> PCLeft2 = CreateObject<Node> ();
+
     Ptr<Node> PCMid1 = CreateObject<Node> ();
+    Ptr<Node> PCMid2 = CreateObject<Node> ();
+
     Ptr<Node> PCRight1 = CreateObject<Node> ();
-    NodeContainer hosts = NodeContainer(PCLeft1, PCMid1, PCRight1);
-//    NodeContainer hosts = NodeContainer(PCLeft1,  PCRight1);
+    NodeContainer hostsLow = NodeContainer(PCLeft1, PCMid1, PCRight1);
+    NodeContainer hostsUp = NodeContainer(PCLeft2, PCMid2, PCRight1);
+    NodeContainer hosts = NodeContainer(PCLeft1,  PCLeft2, PCMid1, PCMid2, PCRight1);
 
     // Create two switch nodes
-    NodeContainer switches;
+    NodeContainer switchesLow;
+    NodeContainer switchesUp;
 
-    switches.Create (4);
+    switchesLow.Create (4);
+    switchesUp.Create (4);
 
     // Use the CsmaHelper to connect hosts and switches
 //    CsmaHelper csmaHelper;
@@ -195,33 +217,58 @@ int main (int argc, char *argv[])
 
     NodeContainer pair;
     NetDeviceContainer pairDevs;
-    NetDeviceContainer hostDevices;
+    NetDeviceContainer hostDevicesLow;
+    NetDeviceContainer hostDevicesUp;
 
-    NetDeviceContainer switchPorts [4];
+    NetDeviceContainer switchPortsLow [4];
+    NetDeviceContainer switchPortsUp [4];
 
-    for (size_t i=0; i<4; i++)
-        switchPorts [i] = NetDeviceContainer ();
+    for (size_t i=0; i<4; i++) {
+        switchPortsLow[i] = NetDeviceContainer();
+        switchPortsUp[i] = NetDeviceContainer();
+    }
 
-    pair = NodeContainer(hosts.Get(0), switches.Get(0));
+    pair = NodeContainer(hostsLow.Get(0), switchesLow.Get(0));
     pairDevs = csmaHelper.Install(pair);
-    hostDevices.Add(pairDevs.Get(0));
-    switchPorts[0].Add(pairDevs.Get(1));
+    hostDevicesLow.Add(pairDevs.Get(0));
+    switchPortsLow[0].Add(pairDevs.Get(1));
 
-
-    pair = NodeContainer(hosts.Get(2), switches.Get(3));
+    pair = NodeContainer(hostsUp.Get(0), switchesUp.Get(0));
     pairDevs = csmaHelper.Install(pair);
-    hostDevices.Add(pairDevs.Get(0));
-    switchPorts[3].Add(pairDevs.Get(1));
+    hostDevicesUp.Add(pairDevs.Get(0));
+    switchPortsUp[0].Add(pairDevs.Get(1));
+
+
+    pair = NodeContainer(hostsLow.Get(2), switchesLow.Get(3));
+    pairDevs = csmaHelper.Install(pair);
+    hostDevicesLow.Add(pairDevs.Get(0));
+    switchPortsLow[3].Add(pairDevs.Get(1));
+
+
+    pair = NodeContainer(hostsUp.Get(2), switchesUp.Get(3));
+    pairDevs = csmaHelper.Install(pair);
+    hostDevicesUp.Add(pairDevs.Get(0));
+    switchPortsUp[3].Add(pairDevs.Get(1));
 
     // Connect the switches
-    SwitchInstall(std::make_pair(0, 1), switchPorts, switches);
-    SwitchInstall(std::make_pair(1, 2), switchPorts, switches);
-    SwitchInstall(std::make_pair(2, 3), switchPorts, switches);
+    SwitchInstall(std::make_pair(0, 1), switchPortsLow, switchesLow);
+    SwitchInstall(std::make_pair(1, 2), switchPortsLow, switchesLow);
+    SwitchInstall(std::make_pair(2, 3), switchPortsLow, switchesLow);
 
-    pair = NodeContainer(hosts.Get(1), switches.Get(1));
+    SwitchInstall(std::make_pair(0, 1), switchPortsUp, switchesUp);
+    SwitchInstall(std::make_pair(1, 2), switchPortsUp, switchesUp);
+    SwitchInstall(std::make_pair(2, 3), switchPortsUp, switchesUp);
+
+    pair = NodeContainer(hostsLow.Get(1), switchesLow.Get(1));
     pairDevs = csmaHelper.Install(pair);
-    hostDevices.Add(pairDevs.Get(0));
-    switchPorts[1].Add(pairDevs.Get(1));
+    hostDevicesLow.Add(pairDevs.Get(0));
+    switchPortsLow[1].Add(pairDevs.Get(1));
+
+
+    pair = NodeContainer(hostsUp.Get(1), switchesUp.Get(1));
+    pairDevs = csmaHelper.Install(pair);
+    hostDevicesUp.Add(pairDevs.Get(0));
+    switchPortsUp[1].Add(pairDevs.Get(1));
 
 
     Ptr<Node> controllerNode = CreateObject<Node> ();
@@ -229,10 +276,14 @@ int main (int argc, char *argv[])
     Ptr<Controller> ctrl = CreateObject<Controller> ();
 
     of13Helper->InstallController (controllerNode, ctrl);
-    of13Helper->InstallSwitch (switches.Get (0), switchPorts [0]);
-    of13Helper->InstallSwitch (switches.Get (1), switchPorts [1]);
-    of13Helper->InstallSwitch (switches.Get (2), switchPorts [2]);
-    of13Helper->InstallSwitch (switches.Get (3), switchPorts [3]);
+    of13Helper->InstallSwitch (switchesLow.Get (0), switchPortsLow [0]);
+    of13Helper->InstallSwitch (switchesLow.Get (1), switchPortsLow [1]);
+    of13Helper->InstallSwitch (switchesLow.Get (2), switchPortsLow [2]);
+    of13Helper->InstallSwitch (switchesLow.Get (3), switchPortsLow [3]);
+    of13Helper->InstallSwitch (switchesUp.Get (0), switchPortsUp [0]);
+    of13Helper->InstallSwitch (switchesUp.Get (1), switchPortsUp [1]);
+    of13Helper->InstallSwitch (switchesUp.Get (2), switchPortsUp [2]);
+    of13Helper->InstallSwitch (switchesUp.Get (3), switchPortsUp [3]);
     of13Helper->CreateOpenFlowChannels ();
 
 
@@ -244,33 +295,61 @@ int main (int argc, char *argv[])
     internet.Install (hosts);
 
     // Set IPv4 host addresses
-    Ipv4AddressHelper ipv4helpr;
-    Ipv4InterfaceContainer hostIpIfaces;
-    ipv4helpr.SetBase ("10.1.1.0", "255.255.255.0");
-    hostIpIfaces = ipv4helpr.Assign (hostDevices);
+    Ipv4AddressHelper ipv4helprLow;
+    Ipv4InterfaceContainer hostIpIfacesLow;
+    ipv4helprLow.SetBase ("10.1.1.0", "255.255.255.0");
+    hostIpIfacesLow = ipv4helprLow.Assign (hostDevicesLow);
+
+    Ipv4AddressHelper ipv4helprUp;
+    Ipv4InterfaceContainer hostIpIfacesUp;
+    ipv4helprUp.SetBase ("10.2.1.0", "255.255.255.0");
+    hostIpIfacesUp = ipv4helprUp.Assign (hostDevicesUp);
 
 
 
 //    Ptr<Socket> srcSocket = Socket::CreateSocket (PCMid1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
-    Ptr<Socket> srcSocketM = Socket::CreateSocket (PCMid1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
-    srcSocketM->Bind ();
-    Ptr<Socket> srcSocketL = Socket::CreateSocket (PCLeft1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
-    srcSocketL->Bind ();
+    Ptr<Socket> srcSocketLU = Socket::CreateSocket (PCLeft2, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    srcSocketLU->Bind ();
+    Ptr<Socket> srcSocketLL = Socket::CreateSocket (PCLeft1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    srcSocketLL->Bind ();
 //
-    Ptr<Socket> dstSocket = Socket::CreateSocket (PCRight1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
-    uint16_t dstport = 12345;
-    Ipv4Address dstaddr = "10.1.1.2";
-    InetSocketAddress dst = InetSocketAddress (dstaddr, dstport);
-    dstSocket->Bind (dst);
-    dstSocket->SetRecvCallback (MakeCallback (&dstSocketRecv));
+    Ptr<Socket> dstSocket1 = Socket::CreateSocket (PCRight1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    uint16_t dstport1 = 12345;
+    Ipv4Address dstaddr1 = "10.1.1.2";
+    InetSocketAddress dst1 = InetSocketAddress (dstaddr1, dstport1);
+    dstSocket1->Bind (dst1);
+    dstSocket1->SetRecvCallback (MakeCallback (&dstSocketRecv));
+
+    Ptr<Socket> dstSocket2 = Socket::CreateSocket (PCRight1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
+    uint16_t dstport2 = 123;
+    Ipv4Address dstaddr2 = "10.2.1.2";
+    InetSocketAddress dst2 = InetSocketAddress (dstaddr2, dstport2);
+    dstSocket2->Bind (dst2);
+    dstSocket2->SetRecvCallback (MakeCallback (&dstSocketRecv));
 
     while (time < rec_time*1.5) {
-        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketL, dstaddr, dstport);
+        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketLL, dstaddr1, dstport1, 0);
+        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketLU, dstaddr2, dstport2, 1);
 //        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketM, dstaddr, dstport);
         time += interval;
     }
 
-    Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 4, ctrl);
+    switch (bad_rec) {
+        case 0:
+            break;
+        case 1:
+            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 4, ctrl);
+            break;
+        case 2:
+            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 8, ctrl);
+            break;
+        case 3:
+            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 4, ctrl);
+            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 8, ctrl);
+            break;
+        default:
+            std::cout << "Bad reconf use option!" << std::endl;
+    }
 
     Simulator::Schedule (Seconds (rec_time*2), &EndSimulation);
     Simulator::Run ();

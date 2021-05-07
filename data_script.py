@@ -16,18 +16,35 @@ for line in f:
         if pos1 == -1:
             data.append((line[0:pos-1], line[pos+2]))
         else:
-            first_num = line[pos1+1: line.find('>', pos)]
-            sec_num = line[line.rfind('<')+1: line.rfind('>')]
-            data.append((first_num, sec_num))
+            first_num_pos = line.find('>', pos)
+            first_num = line[pos1+1: line.find('>', first_num_pos)]
 
-cols = ["A", "B", "C"]
+            sec_num_st = line.find('<', first_num_pos)
+            sec_num_en = line.find('>', sec_num_st)
+            sec_num = line[sec_num_st+1: sec_num_en]
+
+            pac_name_st = line.find('<', sec_num_en)
+            pac_name_en = line.find('>', pac_name_st)
+            pac_name = line[pac_name_st+1: pac_name_en]
+
+            source_name_st = line.find('<', pac_name_en)
+            source_name_en = line.find('>', source_name_st)
+            source_name = line[source_name_st + 1: source_name_en]
+
+
+            data.append((first_num, sec_num, pac_name, source_name))
+
 print(data)
 
 for num in range(len(data)):
     row = sheet1.row(num)
+    ofs = 0
     value = data[num]
-    row.write(0, str(value[0]))
-    row.write(1, str(value[1]))
+    if len(value) != 2:
+        ofs = 0 if value[3] == '0' else 4
+
+    for col in range(len(value)):
+        row.write(col + ofs, str(value[col]))
 
 
 book.save('result.xls')
