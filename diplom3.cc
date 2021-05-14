@@ -42,17 +42,22 @@
 #include "ns3/internet-module.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/applications-module.h"
+#include "ns3/flow-monitor.h"
+#include "ns3/flow-monitor-helper.h"
+#include <chrono>
 #include "ns3/csma-module.h"
 #include <unistd.h>
+#include "thread"
 
+enum event {NorthSendPacket, SouthSendPacket, Reconfiguration,  Waiting};
+enum experiment_type {None, Balanced, Stopped};
 
 using namespace ns3;
 CsmaHelper csmaHelper;
-clock_t start = clock();
+CsmaHelper csmaStopped;
 std::ofstream out;
 int counter1 = 0;
 int counter2 = 0;
-
 
 std::tuple<int, int, int> get_packet_time(Packet pack) {
     size_t size = 12;
@@ -64,8 +69,8 @@ std::tuple<int, int, int> get_packet_time(Packet pack) {
     time = ((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]);
     packet_name = ((out_data[7] << 24) | (out_data[6] << 16) | (out_data[5] << 8) | out_data[4]);
     from = ((out_data[11] << 24) | (out_data[10] << 16) | (out_data[9] << 8) | out_data[8]);
-//    time = ((float)((out_data[3] << 24) | (out_data[2] << 16) | (out_data[1] << 8) | out_data[0]) )/ CLOCKS_PER_SEC;
     free(out_data);
+
     return std::make_tuple(time, packet_name, from);
 }
 
@@ -81,7 +86,9 @@ Ptr<Packet> create_packet(int from) {
     }
     uint8_t *data = static_cast<uint8_t *>(malloc(size));
     int *data_int = (int *)data;
-    data_int[0] = clock() - start;
+
+    int time_now = Now().GetMicroSeconds();
+    data_int[0] = time_now;
     data_int[1] = ct;
     data_int[2] = from;
 
@@ -91,24 +98,26 @@ Ptr<Packet> create_packet(int from) {
 void dstSocketRecv (Ptr<Socket> socket) {
     Address from;
     Ptr<Packet> packet = socket->RecvFrom (from);
-    int time, counter, send_from;
-    std::tie(time, counter, send_from) = get_packet_time(*packet);
-//    out << "Sending time - <" <<  time << "> Current time - <" << clock() << ">" << std::endl;
-    std::cout << "Sending time - <" <<  (time/(double) CLOCKS_PER_SEC) << "> Current time - <" << (clock()/(double) CLOCKS_PER_SEC) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
-    out << "Sending time - <" <<  (time/(double) CLOCKS_PER_SEC) << "> Current time - <" << (clock()/(double) CLOCKS_PER_SEC) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
+    int snd, counter, send_from;
+    std::tie(snd, counter, send_from) = get_packet_time(*packet);
+
+    int rsv = Now().GetMicroSeconds();
+    std::cout << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << round((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
+    out << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << round((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
     packet->RemoveAllPacketTags ();
     packet->RemoveAllByteTags ();
-    InetSocketAddress address = InetSocketAddress::ConvertFrom (from);
-    NS_LOG_INFO ("Destination Received " << packet->GetSize () << " bytes from " << address.GetIpv4 ());
+//    InetSocketAddress address = InetSocketAddress::ConvertFrom (from);
 //    SendStuff (socket, Ipv4Address ("10.10.1.2"), address.GetPort ());
 }
 
 
 void SendStuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port, int from) {
+//    pid_t id1 = fork();
     Ptr <Packet> p = create_packet(from);
     p->AddPaddingAtEnd(100);
     std::cout << "Send to " << dstaddr << std::endl;
     sock->SendTo(p, 0, InetSocketAddress(dstaddr, port));
+//    sleep(1);
     return;
 }
 
@@ -123,6 +132,10 @@ void SwitchInstall(std::pair<size_t, size_t> indexes, NetDeviceContainer* switch
     switchPorts [indexes.second].Add (pairDevs.Get (1));
 }
 
+void AddDelay(CsmaHelper csma, DataRate rate) {
+    csma.SetChannelAttribute ("DataRate", DataRateValue (DataRate (rate)));
+
+}
 
 
 /** Controller 0 installs the rule to forward packets from host 0 to 1 (port 1 to 2). */
@@ -136,16 +149,14 @@ protected:
 
 };
 
-void
-Controller::HandshakeSuccessful (Ptr<const RemoteSwitch> swtch)
+void Controller::HandshakeSuccessful (Ptr<const RemoteSwitch> swtch)
 {
     DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=1 write:output=2");
     DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=2 write:output=1");
 }
 
 
-void
-Controller::BadReconf (uint64_t swtch)
+void Controller::BadReconf (uint64_t swtch)
 {
     DpctlExecute (swtch, "flow-mod cmd=del,table=0,prio=1 in_port=2 write:output=1");
 }
@@ -157,37 +168,105 @@ void OpenFlowCommandRule(uint64_t dpid,  Ptr<Controller> ctrl ) {
 //                        "in_port=4,eth_type=0x0800,ip_proto=6 apply:group=3");
 }
 
+void Nothing() {
+    return;
+}
 
+std::vector<std::pair<float, event>> CreateSchedule(std::tuple<float, float, float>  time_events, experiment_type EventType) {
+    float next_nth_snd, next_sth_snd, rec_time;
+    bool event_completed, delivered_north, delivered_south;
+    std::tie(next_nth_snd, next_sth_snd, rec_time) = time_events;
+    float nth_interval, sth_interval;
+    float cur_time = 0;
+    float general_time = std::min(next_sth_snd, next_nth_snd);
+    float sch_delay = general_time/10;
+    std::vector<std::pair<float, event>> time_schedule;
+
+    std::tie(next_nth_snd, next_sth_snd, rec_time) = time_events;
+    nth_interval = next_nth_snd;
+    sth_interval = next_sth_snd;
+    delivered_north = delivered_south = false;
+
+    while (cur_time < rec_time*2) {
+        event_completed = false;
+        if (cur_time >= next_nth_snd) {
+            time_schedule.emplace_back(std::make_pair(cur_time, NorthSendPacket));
+            next_nth_snd+= nth_interval;
+            event_completed = true;
+            if (EventType == Balanced) {
+                if (delivered_north && delivered_south) {
+                    next_nth_snd = next_sth_snd;
+                    nth_interval = sth_interval;
+                } else {
+                    delivered_north = true;
+                }
+            }
+        }
+        if (cur_time >= next_sth_snd) {
+            time_schedule.emplace_back(std::make_pair(cur_time, SouthSendPacket));
+            next_sth_snd+= sth_interval;
+            event_completed = true;
+            if (EventType == Balanced) {
+                if (delivered_north && delivered_south ) {
+                    next_sth_snd =  next_nth_snd;
+                    sth_interval = nth_interval;
+                } else {
+                    delivered_south = true;
+                }
+            }
+        }
+        if (cur_time >= rec_time) {
+            time_schedule.emplace_back(std::make_pair(cur_time, Reconfiguration));
+            event_completed = true;
+        }
+
+        if (!event_completed) {
+            time_schedule.emplace_back(std::make_pair(cur_time, Waiting));
+        }
+
+        cur_time+=sch_delay;
+    }
+    return time_schedule;
+}
 
 
 
 int main (int argc, char *argv[])
 {
-    float interval = 0.1;
-    float time = 0;
+    float interval_up = 0.1;
+    float interval_dwn = 0.1;
     float rec_time = 10;
     int delay = 2;
     int bad_rec;
+    int exp_type = 0;
+    experiment_type exp_val = None;
+
     std::string daterate = "100Mbps";
 
-
-  // Configure command line parameters
     CommandLine cmd;
     out.open("data.txt"); // окрываем файл для записи
 
     cmd.AddValue ("daterate", "Csma daterate", daterate);
     cmd.AddValue ("delay", "Csma delay(MilliSeconds)", delay);
-    cmd.AddValue ("time_between_packages", "Time between sending packets", interval);
+    cmd.AddValue ("time_between_packages_up", "Time between sending packets", interval_up);
+    cmd.AddValue ("time_between_packages_dwn", "Time between sending packets", interval_dwn);
     cmd.AddValue ("reconfiguration", "Reconfiguration time", rec_time);
     cmd.AddValue ("bad_reconf_on", "Where in bad reconfiguration? 3-everythere, 2-Upper, 1-Lower, 0-Nowhere", bad_rec);
+    cmd.AddValue ("experiment", "Choose type of experiment? 2-Stopped, 1-Balanced, 0-None", exp_type);
+    if (exp_type>= 0 and exp_type<=2)
+        exp_val = static_cast<experiment_type>(exp_type);
     cmd.Parse (argc, argv);
 
     out << "Csma daterate - " <<  daterate << std::endl;
     out << "Csma delay - " <<  delay << std::endl;
-    out << "Time between sending packets - " <<  interval << std::endl;
+    out << "Time between sending north packets - " <<  interval_up << std::endl;
+    out << "Time between sending south packets - " <<  interval_dwn << std::endl;
     out << "Reconfiguration time - " <<  rec_time << std::endl;
 
     // Enable checksum computations (required by OFSwitch13 module)
+//    GlobalValue::Bind ("SimulatorImplementationType",
+//                       StringValue ("ns3::RealtimeSimulatorImpl"));
+
     GlobalValue::Bind ("ChecksumEnabled", BooleanValue (true));
 
     // Create two host nodesu
@@ -238,14 +317,17 @@ int main (int argc, char *argv[])
     hostDevicesUp.Add(pairDevs.Get(0));
     switchPortsUp[0].Add(pairDevs.Get(1));
 
+    csmaStopped.SetChannelAttribute ("DataRate", DataRateValue (DataRate (daterate)));
+    csmaStopped.SetChannelAttribute ("Delay", TimeValue (MilliSeconds (delay)));
 
     pair = NodeContainer(hostsLow.Get(2), switchesLow.Get(3));
-    pairDevs = csmaHelper.Install(pair);
+    pairDevs = csmaStopped.Install(pair);
     hostDevicesLow.Add(pairDevs.Get(0));
     switchPortsLow[3].Add(pairDevs.Get(1));
 
 
     pair = NodeContainer(hostsUp.Get(2), switchesUp.Get(3));
+
     pairDevs = csmaHelper.Install(pair);
     hostDevicesUp.Add(pairDevs.Get(0));
     switchPortsUp[3].Add(pairDevs.Get(1));
@@ -286,15 +368,9 @@ int main (int argc, char *argv[])
     of13Helper->InstallSwitch (switchesUp.Get (3), switchPortsUp [3]);
     of13Helper->CreateOpenFlowChannels ();
 
-
-
-    // TapBridge the controller device to local machine
-    // The default configuration expects a controller on local port 6653
-    // Install the TCP/IP stack into hosts nodes
     InternetStackHelper internet;
     internet.Install (hosts);
 
-    // Set IPv4 host addresses
     Ipv4AddressHelper ipv4helprLow;
     Ipv4InterfaceContainer hostIpIfacesLow;
     ipv4helprLow.SetBase ("10.1.1.0", "255.255.255.0");
@@ -307,12 +383,11 @@ int main (int argc, char *argv[])
 
 
 
-//    Ptr<Socket> srcSocket = Socket::CreateSocket (PCMid1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     Ptr<Socket> srcSocketLU = Socket::CreateSocket (PCLeft2, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     srcSocketLU->Bind ();
     Ptr<Socket> srcSocketLL = Socket::CreateSocket (PCLeft1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     srcSocketLL->Bind ();
-//
+
     Ptr<Socket> dstSocket1 = Socket::CreateSocket (PCRight1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     uint16_t dstport1 = 12345;
     Ipv4Address dstaddr1 = "10.1.1.2";
@@ -327,31 +402,51 @@ int main (int argc, char *argv[])
     dstSocket2->Bind (dst2);
     dstSocket2->SetRecvCallback (MakeCallback (&dstSocketRecv));
 
-    while (time < rec_time*1.5) {
-        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketLL, dstaddr1, dstport1, 0);
-        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketLU, dstaddr2, dstport2, 1);
-//        Simulator::Schedule (Seconds (time),&SendStuff, srcSocketM, dstaddr, dstport);
-        time += interval;
+    int last;
+    std::vector<std::pair<float, event>> time_schedule = CreateSchedule(std::make_tuple(interval_up, interval_dwn, rec_time), exp_val);
+
+    for (auto &element : time_schedule) {
+        switch (element.second) {
+            case NorthSendPacket:
+                Simulator::Schedule(Seconds (element.first) , &SendStuff, srcSocketLL, dstaddr1, dstport1, 0);
+                if (exp_val == Stopped) {
+                    Simulator::Schedule(Seconds(element.first), &AddDelay, csmaStopped, DataRate ("0Mbps"));
+                }
+
+                break;
+            case SouthSendPacket:
+                Simulator::Schedule(Seconds (element.first) , &SendStuff, srcSocketLU, dstaddr2, dstport2, 1);
+                break;
+            case Reconfiguration:
+                switch (bad_rec) {
+                    case 0:
+                        break;
+                    case 1:
+                        Simulator::Schedule(Seconds(element.first), &OpenFlowCommandRule, 4, ctrl);
+                        break;
+                    case 2:
+                        Simulator::Schedule(Seconds(element.first), &OpenFlowCommandRule, 8, ctrl);
+                        break;
+                    case 3:
+                        Simulator::Schedule(Seconds(element.first), &OpenFlowCommandRule, 4, ctrl);
+                        Simulator::Schedule(Seconds(element.first), &OpenFlowCommandRule, 8, ctrl);
+                        break;
+                    default:
+                        exit(0);
+                }
+                break;
+            case Waiting:
+                Simulator::Schedule(Seconds(element.first), &Nothing);
+                break;
+        }
+        last = element.first;
     }
 
-    switch (bad_rec) {
-        case 0:
-            break;
-        case 1:
-            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 4, ctrl);
-            break;
-        case 2:
-            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 8, ctrl);
-            break;
-        case 3:
-            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 4, ctrl);
-            Simulator::Schedule (Seconds (rec_time), &OpenFlowCommandRule, 8, ctrl);
-            break;
-        default:
-            std::cout << "Bad reconf use option!" << std::endl;
-    }
+    Simulator::Schedule(Seconds(last), &AddDelay, csmaStopped, DataRate ("100Mbps"));
 
-    Simulator::Schedule (Seconds (rec_time*2), &EndSimulation);
+    Simulator::Stop (Seconds (11.0));
+//    Simulator::Schedule (Seconds (rec_time*2), &EndSimulation);
+//    impl->Schedule (Seconds (rec_time*2), MakeEvent(&EndSimulation));
     Simulator::Run ();
 
     Simulator::Destroy ();
