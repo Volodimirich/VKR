@@ -21,6 +21,20 @@ namespace {
     int counter2 = 0;
 }
 
+class Controller : public OFSwitch13Controller
+{
+public:
+    void BadReconf (uint64_t swtch) {
+        DpctlExecute (swtch, "flow-mod cmd=del,table=0,prio=1 in_port=2 write:output=1");
+    }
+protected:
+    void HandshakeSuccessful (Ptr<const RemoteSwitch> swtch) {
+        DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=1 write:output=2");
+        DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=2 write:output=1");
+    }
+};
+
+
 std::tuple<int, int, int> get_packet_time(Packet pack) {
     size_t size = 12;
     int time;
@@ -57,21 +71,21 @@ Ptr<Packet> create_packet(int from) {
     return Create<Packet> (data, size);
 }
 
-void dstSocketRecv (Ptr<Socket> socket) {
+void dst_socket_recv (Ptr<Socket> socket) {
     Address from;
     Ptr<Packet> packet = socket->RecvFrom (from);
     int snd, counter, send_from;
     std::tie(snd, counter, send_from) = get_packet_time(*packet);
 
     int rsv = Now().GetMicroSeconds();
-    std::cout << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << round((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
-    out << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << round((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
+    std::cout << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << ((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
+    out << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << ((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
     packet->RemoveAllPacketTags ();
     packet->RemoveAllByteTags ();
 }
 
 
-void SendStuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port, int from) {
+void send_stuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port, int from) {
     Ptr <Packet> p = create_packet(from);
     p->AddPaddingAtEnd(100);
     std::cout << "Send to " << dstaddr << std::endl;
@@ -83,7 +97,7 @@ void EndSimulation() {
     Simulator::Stop();
 }
 
-void SwitchInstall(std::pair<size_t, size_t> indexes, NetDeviceContainer* switchPorts, NodeContainer switches) {
+void switch_install(std::pair<size_t, size_t> indexes, NetDeviceContainer* switchPorts, NodeContainer switches) {
     NodeContainer pair = NodeContainer (switches.Get (indexes.first), switches.Get (indexes.second));
     NetDeviceContainer pairDevs = csmaHelper.Install (pair);
     switchPorts [indexes.first].Add (pairDevs.Get (0));
@@ -94,22 +108,6 @@ void AddDelay(CsmaHelper csma, DataRate rate) {
     csma.SetChannelAttribute ("DataRate", DataRateValue (DataRate (rate)));
 
 }
-
-
-class Controller : public OFSwitch13Controller
-{
-public:
-    void BadReconf (uint64_t swtch) {
-        DpctlExecute (swtch, "flow-mod cmd=del,table=0,prio=1 in_port=2 write:output=1");
-    }
-protected:
-    void HandshakeSuccessful (Ptr<const RemoteSwitch> swtch) {
-        DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=1 write:output=2");
-        DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=2 write:output=1");
-    }
-};
-
-
 
 void OpenFlowCommandRule(uint64_t dpid,  Ptr<Controller> ctrl ) {
     ctrl->BadReconf(dpid);
@@ -267,13 +265,13 @@ int main (int argc, char *argv[])
     hostDevicesUp.Add(pairDevs.Get(0));
     switchPortsUp[3].Add(pairDevs.Get(1));
 
-    SwitchInstall(std::make_pair(0, 1), switchPortsLow, switchesLow);
-    SwitchInstall(std::make_pair(1, 2), switchPortsLow, switchesLow);
-    SwitchInstall(std::make_pair(2, 3), switchPortsLow, switchesLow);
+    switch_install(std::make_pair(0, 1), switchPortsLow, switchesLow);
+    switch_install(std::make_pair(1, 2), switchPortsLow, switchesLow);
+    switch_install(std::make_pair(2, 3), switchPortsLow, switchesLow);
 
-    SwitchInstall(std::make_pair(0, 1), switchPortsUp, switchesUp);
-    SwitchInstall(std::make_pair(1, 2), switchPortsUp, switchesUp);
-    SwitchInstall(std::make_pair(2, 3), switchPortsUp, switchesUp);
+    switch_install(std::make_pair(0, 1), switchPortsUp, switchesUp);
+    switch_install(std::make_pair(1, 2), switchPortsUp, switchesUp);
+    switch_install(std::make_pair(2, 3), switchPortsUp, switchesUp);
 
     pair = NodeContainer(hostsLow.Get(1), switchesLow.Get(1));
     pairDevs = csmaHelper.Install(pair);
@@ -325,28 +323,28 @@ int main (int argc, char *argv[])
     Ipv4Address dstaddr1 = "10.1.1.2";
     InetSocketAddress dst1 = InetSocketAddress (dstaddr1, dstport1);
     dstSocket1->Bind (dst1);
-    dstSocket1->SetRecvCallback (MakeCallback (&dstSocketRecv));
+    dstSocket1->SetRecvCallback (MakeCallback (&dst_socket_recv));
 
     Ptr<Socket> dstSocket2 = Socket::CreateSocket (PCRight1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     uint16_t dstport2 = 123;
     Ipv4Address dstaddr2 = "10.2.1.2";
     InetSocketAddress dst2 = InetSocketAddress (dstaddr2, dstport2);
     dstSocket2->Bind (dst2);
-    dstSocket2->SetRecvCallback (MakeCallback (&dstSocketRecv));
+    dstSocket2->SetRecvCallback (MakeCallback (&dst_socket_recv));
 
     scheduler time_schedule = CreateSchedule(std::make_tuple(interval_up, interval_dwn, rec_time), exp_val);
 
     for (auto &element : time_schedule) {
         switch (element.second) {
             case NorthSendPacket:
-                Simulator::Schedule(Seconds (element.first) , &SendStuff, srcSocketLL, dstaddr1, dstport1, 0);
+                Simulator::Schedule(Seconds (element.first) , &send_stuff, srcSocketLL, dstaddr1, dstport1, 0);
                 if (exp_val == Stopped) {
                     Simulator::Schedule(Seconds(element.first), &AddDelay, csmaStopped, DataRate ("0Mbps"));
                 }
 
                 break;
             case SouthSendPacket:
-                Simulator::Schedule(Seconds (element.first) , &SendStuff, srcSocketLU, dstaddr2, dstport2, 1);
+                Simulator::Schedule(Seconds (element.first) , &send_stuff, srcSocketLU, dstaddr2, dstport2, 1);
                 break;
             case Reconfiguration:
                 switch (bad_rec) {
