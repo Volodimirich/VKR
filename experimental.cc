@@ -1,63 +1,25 @@
-        /* -*-  Mode: C++; c-file-style: "gnu"; indent-tabs-mode:nil; -*- */
-/*
- * Copyright (c) 2017 University of Campinas (Unicamp)
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation;
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
- * Author: Luciano Chaves <luciano@lrc.ic.unicamp.br>
- *
- * Two hosts connected to different OpenFlow switches.
- * Both switches are managed by the same external controller application.
- *
- *                        External Controller
- *                                |
- *                         +-------------+
- *                         |             |
- *                  +----------+     +----------+
- *       Host 0 === | Switch 0 | === | Switch 1 | === Host 1
- *                  +----------+     +----------+
- */
-
 #include <ns3/core-module.h>
 #include <ns3/network-module.h>
 #include <ns3/csma-module.h>
 #include <ns3/internet-module.h>
 #include <ns3/ofswitch13-module.h>
 #include <ns3/internet-apps-module.h>
-#include <fstream>
-#include <string>
-#include "ns3/core-module.h"
-#include "ns3/network-module.h"
-#include "ns3/internet-module.h"
-#include "ns3/point-to-point-module.h"
 #include "ns3/applications-module.h"
-#include "ns3/flow-monitor.h"
-#include "ns3/flow-monitor-helper.h"
-#include <chrono>
-#include "ns3/csma-module.h"
 #include <unistd.h>
-#include "thread"
 
 enum event {NorthSendPacket, SouthSendPacket, Reconfiguration,  Waiting};
 enum experiment_type {None, Balanced, Stopped};
 
 using namespace ns3;
-CsmaHelper csmaHelper;
-CsmaHelper csmaStopped;
-std::ofstream out;
-int counter1 = 0;
-int counter2 = 0;
+using scheduler = std::vector<std::pair<float, event>>;
+
+namespace {
+    CsmaHelper csmaHelper;
+    CsmaHelper csmaStopped;
+    std::ofstream out;
+    int counter1 = 0;
+    int counter2 = 0;
+}
 
 std::tuple<int, int, int> get_packet_time(Packet pack) {
     size_t size = 12;
@@ -106,18 +68,14 @@ void dstSocketRecv (Ptr<Socket> socket) {
     out << "Sending time - <" <<  ((double) snd /1000000) << "> Current time - <" << round((double) rsv/1000000) << "> Packet name - <" << counter << "> Sended from - <" << send_from << ">" << std::endl;
     packet->RemoveAllPacketTags ();
     packet->RemoveAllByteTags ();
-//    InetSocketAddress address = InetSocketAddress::ConvertFrom (from);
-//    SendStuff (socket, Ipv4Address ("10.10.1.2"), address.GetPort ());
 }
 
 
 void SendStuff (Ptr<Socket> sock, Ipv4Address dstaddr, uint16_t port, int from) {
-//    pid_t id1 = fork();
     Ptr <Packet> p = create_packet(from);
     p->AddPaddingAtEnd(100);
     std::cout << "Send to " << dstaddr << std::endl;
     sock->SendTo(p, 0, InetSocketAddress(dstaddr, port));
-//    sleep(1);
     return;
 }
 
@@ -138,41 +96,30 @@ void AddDelay(CsmaHelper csma, DataRate rate) {
 }
 
 
-/** Controller 0 installs the rule to forward packets from host 0 to 1 (port 1 to 2). */
 class Controller : public OFSwitch13Controller
 {
 public:
-    void BadReconf (uint64_t swtch);
-
+    void BadReconf (uint64_t swtch) {
+        DpctlExecute (swtch, "flow-mod cmd=del,table=0,prio=1 in_port=2 write:output=1");
+    }
 protected:
-    void HandshakeSuccessful (Ptr<const RemoteSwitch> swtch);
-
+    void HandshakeSuccessful (Ptr<const RemoteSwitch> swtch) {
+        DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=1 write:output=2");
+        DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=2 write:output=1");
+    }
 };
 
-void Controller::HandshakeSuccessful (Ptr<const RemoteSwitch> swtch)
-{
-    DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=1 write:output=2");
-    DpctlExecute (swtch, "flow-mod cmd=add,table=0,prio=2 in_port=2 write:output=1");
-}
-
-
-void Controller::BadReconf (uint64_t swtch)
-{
-    DpctlExecute (swtch, "flow-mod cmd=del,table=0,prio=1 in_port=2 write:output=1");
-}
 
 
 void OpenFlowCommandRule(uint64_t dpid,  Ptr<Controller> ctrl ) {
     ctrl->BadReconf(dpid);
-//    DpctlExecute (dpid, "flow-mod cmd=add,table=0,prio=700 "
-//                        "in_port=4,eth_type=0x0800,ip_proto=6 apply:group=3");
 }
 
 void Nothing() {
     return;
 }
 
-std::vector<std::pair<float, event>> CreateSchedule(std::tuple<float, float, float>  time_events, experiment_type EventType) {
+scheduler CreateSchedule(std::tuple<float, float, float>  time_events, experiment_type EventType) {
     float next_nth_snd, next_sth_snd, rec_time;
     bool event_completed, delivered_north, delivered_south;
     std::tie(next_nth_snd, next_sth_snd, rec_time) = time_events;
@@ -180,7 +127,7 @@ std::vector<std::pair<float, event>> CreateSchedule(std::tuple<float, float, flo
     float cur_time = 0;
     float general_time = std::min(next_sth_snd, next_nth_snd);
     float sch_delay = general_time/10;
-    std::vector<std::pair<float, event>> time_schedule;
+    scheduler time_schedule;
 
     std::tie(next_nth_snd, next_sth_snd, rec_time) = time_events;
     nth_interval = next_nth_snd;
@@ -229,18 +176,15 @@ std::vector<std::pair<float, event>> CreateSchedule(std::tuple<float, float, flo
     return time_schedule;
 }
 
-
-
 int main (int argc, char *argv[])
 {
+    int bad_rec, last;
     float interval_up = 0.1;
     float interval_dwn = 0.1;
     float rec_time = 10;
     int delay = 2;
-    int bad_rec;
     int exp_type = 0;
     experiment_type exp_val = None;
-
     std::string daterate = "100Mbps";
 
     CommandLine cmd;
@@ -253,6 +197,7 @@ int main (int argc, char *argv[])
     cmd.AddValue ("reconfiguration", "Reconfiguration time", rec_time);
     cmd.AddValue ("bad_reconf_on", "Where in bad reconfiguration? 3-everythere, 2-Upper, 1-Lower, 0-Nowhere", bad_rec);
     cmd.AddValue ("experiment", "Choose type of experiment? 2-Stopped, 1-Balanced, 0-None", exp_type);
+
     if (exp_type>= 0 and exp_type<=2)
         exp_val = static_cast<experiment_type>(exp_type);
     cmd.Parse (argc, argv);
@@ -263,13 +208,8 @@ int main (int argc, char *argv[])
     out << "Time between sending south packets - " <<  interval_dwn << std::endl;
     out << "Reconfiguration time - " <<  rec_time << std::endl;
 
-    // Enable checksum computations (required by OFSwitch13 module)
-//    GlobalValue::Bind ("SimulatorImplementationType",
-//                       StringValue ("ns3::RealtimeSimulatorImpl"));
-
     GlobalValue::Bind ("ChecksumEnabled", BooleanValue (true));
 
-    // Create two host nodesu
     Ptr<Node> PCLeft1 = CreateObject<Node> ();
     Ptr<Node> PCLeft2 = CreateObject<Node> ();
 
@@ -281,16 +221,12 @@ int main (int argc, char *argv[])
     NodeContainer hostsUp = NodeContainer(PCLeft2, PCMid2, PCRight1);
     NodeContainer hosts = NodeContainer(PCLeft1,  PCLeft2, PCMid1, PCMid2, PCRight1);
 
-    // Create two switch nodes
     NodeContainer switchesLow;
     NodeContainer switchesUp;
 
     switchesLow.Create (4);
     switchesUp.Create (4);
 
-    // Use the CsmaHelper to connect hosts and switches
-//    CsmaHelper csmaHelper;
-//    csmaHelper.SetChannelAttribute ("DataRate", DataRateValue (DataRate ("100Mbps")));
     csmaHelper.SetChannelAttribute ("DataRate", DataRateValue (DataRate (daterate)));
     csmaHelper.SetChannelAttribute ("Delay", TimeValue (MilliSeconds (delay)));
 
@@ -325,14 +261,12 @@ int main (int argc, char *argv[])
     hostDevicesLow.Add(pairDevs.Get(0));
     switchPortsLow[3].Add(pairDevs.Get(1));
 
-
     pair = NodeContainer(hostsUp.Get(2), switchesUp.Get(3));
 
     pairDevs = csmaHelper.Install(pair);
     hostDevicesUp.Add(pairDevs.Get(0));
     switchPortsUp[3].Add(pairDevs.Get(1));
 
-    // Connect the switches
     SwitchInstall(std::make_pair(0, 1), switchPortsLow, switchesLow);
     SwitchInstall(std::make_pair(1, 2), switchPortsLow, switchesLow);
     SwitchInstall(std::make_pair(2, 3), switchPortsLow, switchesLow);
@@ -351,7 +285,6 @@ int main (int argc, char *argv[])
     pairDevs = csmaHelper.Install(pair);
     hostDevicesUp.Add(pairDevs.Get(0));
     switchPortsUp[1].Add(pairDevs.Get(1));
-
 
     Ptr<Node> controllerNode = CreateObject<Node> ();
     Ptr<OFSwitch13InternalHelper> of13Helper = CreateObject<OFSwitch13InternalHelper> ();
@@ -382,7 +315,6 @@ int main (int argc, char *argv[])
     hostIpIfacesUp = ipv4helprUp.Assign (hostDevicesUp);
 
 
-
     Ptr<Socket> srcSocketLU = Socket::CreateSocket (PCLeft2, TypeId::LookupByName ("ns3::UdpSocketFactory"));
     srcSocketLU->Bind ();
     Ptr<Socket> srcSocketLL = Socket::CreateSocket (PCLeft1, TypeId::LookupByName ("ns3::UdpSocketFactory"));
@@ -402,8 +334,7 @@ int main (int argc, char *argv[])
     dstSocket2->Bind (dst2);
     dstSocket2->SetRecvCallback (MakeCallback (&dstSocketRecv));
 
-    int last;
-    std::vector<std::pair<float, event>> time_schedule = CreateSchedule(std::make_tuple(interval_up, interval_dwn, rec_time), exp_val);
+    scheduler time_schedule = CreateSchedule(std::make_tuple(interval_up, interval_dwn, rec_time), exp_val);
 
     for (auto &element : time_schedule) {
         switch (element.second) {
@@ -445,8 +376,6 @@ int main (int argc, char *argv[])
     Simulator::Schedule(Seconds(last), &AddDelay, csmaStopped, DataRate ("100Mbps"));
 
     Simulator::Stop (Seconds (11.0));
-//    Simulator::Schedule (Seconds (rec_time*2), &EndSimulation);
-//    impl->Schedule (Seconds (rec_time*2), MakeEvent(&EndSimulation));
     Simulator::Run ();
 
     Simulator::Destroy ();
